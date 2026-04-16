@@ -32,9 +32,14 @@ class S3:
         max_retries:           Maximum retry attempts on transient S3 errors
                                (ThrottlingException, ServiceUnavailable, etc.).
                                Default: 3. Set to 0 to disable retry.
+                               **Note:** ``upload()``, ``download()``, and
+                               ``copy()`` use the boto3 TransferManager, which
+                               manages its own part-level retry via botocore.
+                               These operations are not affected by this setting.
         retry_delay:           Base sleep time in seconds before the first retry.
                                Each subsequent retry doubles this value plus
-                               random jitter. Default: 0.1.
+                               random jitter. Default: 0.1. Same TransferManager
+                               caveat as ``max_retries`` applies.
         **session_kwargs:      Any extra keyword arguments forwarded to boto3.Session.
 
     Example::

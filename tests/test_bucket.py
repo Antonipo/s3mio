@@ -285,14 +285,14 @@ class TestPrefix:
         folder.put("f2.txt", "b")
         folder.put("f3.txt", "c")
         bucket.put("keep.txt", "safe")  # outside prefix
-        deleted = folder.delete_all()
-        assert deleted == 3
+        result = folder.delete_all()
+        assert len(result) == 3
         assert folder.list() == []
         assert bucket.exists("keep.txt")  # untouched
 
-    def test_prefix_delete_all_empty_returns_zero(self, bucket: Bucket) -> None:
+    def test_prefix_delete_all_empty_returns_empty_result(self, bucket: Bucket) -> None:
         folder = bucket / "empty"
-        assert folder.delete_all() == 0
+        assert len(folder.delete_all()) == 0
 
     def test_prefix_method_equivalent_to_slash(self, bucket: Bucket) -> None:
         p1 = bucket / "logs" / "2025"

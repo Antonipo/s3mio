@@ -7,7 +7,13 @@ import random
 import time
 from typing import Any, Callable
 
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    IncompleteReadError,
+    ReadTimeoutError,
+)
 
 logger = logging.getLogger("s3mio")
 
@@ -24,6 +30,14 @@ _RETRYABLE_CODES: frozenset[str] = frozenset(
         "SlowDown",  # S3-specific throttling code returned as HTTP 503
         "503",
     }
+)
+
+# BotoCoreError subclasses representing transient network failures (not ClientErrors)
+_RETRYABLE_NETWORK_ERRORS = (
+    EndpointConnectionError,
+    ConnectTimeoutError,
+    ReadTimeoutError,
+    IncompleteReadError,
 )
 
 
@@ -54,6 +68,10 @@ def call_with_retry(
         ClientError: Propagated unchanged when the error code is not in
                      :data:`_RETRYABLE_CODES`, or when all *max_retries*
                      attempts are exhausted.
+        BotoCoreError: Network-level errors (EndpointConnectionError,
+                       ConnectTimeoutError, ReadTimeoutError,
+                       IncompleteReadError) are retried like throttle errors.
+                       Propagated when all *max_retries* attempts are exhausted.
 
     Example::
 
@@ -79,6 +97,18 @@ def call_with_retry(
             logger.warning(
                 "Transient S3 error [%s], retry %d/%d in %.2fs",
                 code,
+                attempt + 1,
+                max_retries,
+                delay,
+            )
+            time.sleep(delay)
+        except _RETRYABLE_NETWORK_ERRORS as exc:
+            if attempt >= max_retries:
+                raise
+            delay = base_delay * (2**attempt) + random.uniform(0, base_delay)
+            logger.warning(
+                "Network error (%s), retry %d/%d in %.2fs",
+                type(exc).__name__,
                 attempt + 1,
                 max_retries,
                 delay,

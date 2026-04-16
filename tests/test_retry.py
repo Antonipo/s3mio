@@ -5,7 +5,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 
 from s3mio import S3
 from s3mio.bucket import Bucket
@@ -144,6 +149,40 @@ class TestCallWithRetry:
                 result = call_with_retry(func, 1, 0.0)
             assert result == "ok", f"Code {code!r} should be retryable"
 
+    def test_retries_on_endpoint_connection_error(self) -> None:
+        """EndpointConnectionError (network failure) is retried like a throttle."""
+        exc = EndpointConnectionError(endpoint_url="https://s3.amazonaws.com")
+        func = MagicMock(side_effect=[exc, "ok"])
+        with patch("s3mio.retry.time.sleep"):
+            result = call_with_retry(func, 1, 0.0)
+        assert result == "ok"
+        assert func.call_count == 2
+
+    def test_retries_on_connect_timeout(self) -> None:
+        """ConnectTimeoutError (connection timed out) is retried."""
+        exc = ConnectTimeoutError(endpoint_url="https://s3.amazonaws.com")
+        func = MagicMock(side_effect=[exc, "ok"])
+        with patch("s3mio.retry.time.sleep"):
+            result = call_with_retry(func, 1, 0.0)
+        assert result == "ok"
+
+    def test_retries_on_read_timeout(self) -> None:
+        """ReadTimeoutError (read timed out mid-response) is retried."""
+        exc = ReadTimeoutError(endpoint_url="https://s3.amazonaws.com")
+        func = MagicMock(side_effect=[exc, "ok"])
+        with patch("s3mio.retry.time.sleep"):
+            result = call_with_retry(func, 1, 0.0)
+        assert result == "ok"
+
+    def test_network_error_raises_after_max_retries(self) -> None:
+        """Network errors are propagated once all retry attempts are exhausted."""
+        exc = EndpointConnectionError(endpoint_url="https://s3.amazonaws.com")
+        func = MagicMock(side_effect=exc)
+        with patch("s3mio.retry.time.sleep"):
+            with pytest.raises(EndpointConnectionError):
+                call_with_retry(func, 2, 0.0)
+        assert func.call_count == 3  # 1 initial + 2 retries
+
 
 # ---------------------------------------------------------------------------
 # S3 retry configuration
@@ -279,27 +318,14 @@ class TestBucketRetryIntegration:
 
         with patch.object(bucket._s3.client, "delete_objects", side_effect=flaky_delete):
             with patch("s3mio.retry.time.sleep"):
-                deleted = bucket.delete_many(["a.txt"])
+                result = bucket.delete_many(["a.txt"])
 
-        assert deleted == 1
+        assert len(result) == 1
         assert call_count[0] == 2
 
-    def test_copy_retries_on_internal_error(self, bucket: Bucket) -> None:
-        """bucket.copy() retries on InternalError and succeeds."""
+    def test_copy_preserves_content(self, bucket: Bucket) -> None:
+        """bucket.copy() correctly copies object content via TransferManager."""
         bucket.put("src.txt", "content")
-        call_count = [0]
-        original = bucket._s3.client.copy_object
-
-        def flaky_copy(**kwargs):
-            """Fail once with InternalError then succeed."""
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise _client_error("InternalError")
-            return original(**kwargs)
-
-        with patch.object(bucket._s3.client, "copy_object", side_effect=flaky_copy):
-            with patch("s3mio.retry.time.sleep"):
-                bucket.copy("src.txt", "dst.txt")
-
-        assert call_count[0] == 2
+        bucket.copy("src.txt", "dst.txt")
         assert bucket.exists("dst.txt")
+        assert bucket.get_text("dst.txt") == "content"

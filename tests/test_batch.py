@@ -1,7 +1,10 @@
 """Tests for Fase 3 — delete_many(), copy(), copy_many()."""
 
+from unittest.mock import patch
+
 import pytest
 
+from s3mio import DeleteResult
 from s3mio.bucket import Bucket
 from s3mio.exceptions import ObjectNotFoundError, ValidationError
 
@@ -16,21 +19,26 @@ class TestBucketDeleteMany:
         keys = ["tmp/a.json", "tmp/b.json", "tmp/c.json"]
         for k in keys:
             bucket.put(k, "data")
-        deleted = bucket.delete_many(keys)
-        assert deleted == 3
+        result = bucket.delete_many(keys)
+        assert len(result) == 3
         for k in keys:
             assert not bucket.exists(k)
 
-    def test_delete_many_returns_count(self, bucket: Bucket) -> None:
-        """Return value equals the number of keys passed."""
+    def test_delete_many_returns_delete_result(self, bucket: Bucket) -> None:
+        """Return value is a DeleteResult with deleted/failed lists."""
         for i in range(5):
             bucket.put(f"item/{i}.txt", "x")
-        count = bucket.delete_many([f"item/{i}.txt" for i in range(5)])
-        assert count == 5
+        result = bucket.delete_many([f"item/{i}.txt" for i in range(5)])
+        assert isinstance(result, DeleteResult)
+        assert len(result) == 5
+        assert result.failed == []
 
     def test_delete_many_empty_list_is_noop(self, bucket: Bucket) -> None:
-        """Passing an empty list returns 0 and raises no errors."""
-        assert bucket.delete_many([]) == 0
+        """Passing an empty list returns an empty DeleteResult."""
+        result = bucket.delete_many([])
+        assert isinstance(result, DeleteResult)
+        assert len(result) == 0
+        assert result.failed == []
 
     def test_delete_many_preserves_other_objects(self, bucket: Bucket) -> None:
         """Objects not in the key list are untouched."""
@@ -41,14 +49,14 @@ class TestBucketDeleteMany:
 
     def test_delete_many_nonexistent_keys_is_idempotent(self, bucket: Bucket) -> None:
         """Deleting non-existent keys does not raise an error (S3 is idempotent)."""
-        count = bucket.delete_many(["ghost/a.txt", "ghost/b.txt"])
-        assert count == 2
+        result = bucket.delete_many(["ghost/a.txt", "ghost/b.txt"])
+        assert len(result) == 2
 
     def test_delete_many_mixed_existing_and_missing(self, bucket: Bucket) -> None:
         """A mix of existing and missing keys is handled without error."""
         bucket.put("mix/real.txt", "here")
-        count = bucket.delete_many(["mix/real.txt", "mix/ghost.txt"])
-        assert count == 2
+        result = bucket.delete_many(["mix/real.txt", "mix/ghost.txt"])
+        assert len(result) == 2
         assert not bucket.exists("mix/real.txt")
 
     def test_delete_many_large_batch_chunked(self, bucket: Bucket) -> None:
@@ -57,9 +65,39 @@ class TestBucketDeleteMany:
         keys = [f"bulk/{i}.txt" for i in range(n)]
         for k in keys:
             bucket.put(k, "x")
-        deleted = bucket.delete_many(keys)
-        assert deleted == n
+        result = bucket.delete_many(keys)
+        assert len(result) == n
         assert bucket.list(prefix="bulk/") == []
+
+    def test_delete_many_partial_failure_captured_in_result(self, bucket: Bucket) -> None:
+        """Per-object S3 errors are collected in DeleteResult.failed, not raised."""
+        bucket.put("good.txt", "data")
+        bucket.put("also_good.txt", "data")
+
+        original_delete = bucket._s3.client.delete_objects
+
+        def patched_delete(**kwargs):
+            """Inject a per-object error for one of the keys."""
+            resp = original_delete(**kwargs)
+            resp.setdefault("Errors", []).append(
+                {"Key": "also_good.txt", "Code": "ObjectLocked", "Message": "locked"}
+            )
+            return resp
+
+        with patch.object(bucket._s3.client, "delete_objects", side_effect=patched_delete):
+            result = bucket.delete_many(["good.txt", "also_good.txt"])
+
+        assert len(result) == 1
+        assert result.deleted == ["good.txt"]
+        assert len(result.failed) == 1
+        assert result.failed[0] == ("also_good.txt", "ObjectLocked")
+        assert not bool(result)  # False because failures exist
+
+    def test_delete_result_bool_true_when_no_failures(self, bucket: Bucket) -> None:
+        """DeleteResult is truthy when all deletes succeeded."""
+        bucket.put("ok.txt", "x")
+        result = bucket.delete_many(["ok.txt"])
+        assert bool(result) is True
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +206,8 @@ class TestPrefixDeleteMany:
         folder = bucket / "cache"
         folder.put("a.json", "a")
         folder.put("b.json", "b")
-        deleted = folder.delete_many(["a.json", "b.json"])
-        assert deleted == 2
+        result = folder.delete_many(["a.json", "b.json"])
+        assert len(result) == 2
         assert not bucket.exists("cache/a.json")
         assert not bucket.exists("cache/b.json")
 
@@ -184,9 +222,10 @@ class TestPrefixDeleteMany:
         assert bucket.exists("keep/safe.txt")
 
     def test_prefix_delete_many_empty_list(self, bucket: Bucket) -> None:
-        """Empty list returns 0."""
+        """Empty list returns an empty DeleteResult."""
         folder = bucket / "empty"
-        assert folder.delete_many([]) == 0
+        result = folder.delete_many([])
+        assert len(result) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -232,13 +271,15 @@ class TestPrefixCopy:
 
 
 class TestPrefixDeleteAll:
-    def test_delete_all_still_works_after_refactor(self, bucket: Bucket) -> None:
-        """delete_all() correctly removes all objects under the prefix."""
+    def test_delete_all_returns_delete_result(self, bucket: Bucket) -> None:
+        """delete_all() returns a DeleteResult with deleted keys."""
         folder = bucket / "cleanup"
         for i in range(10):
             folder.put(f"file{i}.txt", "data")
-        deleted = folder.delete_all()
-        assert deleted == 10
+        result = folder.delete_all()
+        assert isinstance(result, DeleteResult)
+        assert len(result) == 10
+        assert result.failed == []
         assert folder.list() == []
 
     def test_delete_all_does_not_touch_sibling_prefix(self, bucket: Bucket) -> None:
@@ -249,6 +290,8 @@ class TestPrefixDeleteAll:
         folder.delete_all()
         assert bucket.exists("keep/safe.txt")
 
-    def test_delete_all_empty_prefix_returns_zero(self, bucket: Bucket) -> None:
-        """delete_all() on an empty prefix returns 0 without error."""
-        assert (bucket / "empty").delete_all() == 0
+    def test_delete_all_empty_prefix_returns_empty_result(self, bucket: Bucket) -> None:
+        """delete_all() on an empty prefix returns an empty DeleteResult."""
+        result = (bucket / "empty").delete_all()
+        assert isinstance(result, DeleteResult)
+        assert len(result) == 0

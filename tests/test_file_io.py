@@ -78,6 +78,38 @@ class TestBucketUpload:
         bucket.upload(local, "upload/mono.txt", on_progress=calls.append)
         assert all(0.0 <= p <= 100.0 for p in calls)
 
+    def test_upload_explicit_content_type(self, bucket: Bucket, tmp_path: Path) -> None:
+        """Explicit content_type overrides auto-detection."""
+        local = _write_local(tmp_path, "data.bin", b"\x00\x01\x02")
+        bucket.upload(local, "upload/data.bin", content_type="image/png")
+        info = bucket.head("upload/data.bin")
+        assert info.content_type == "image/png"
+
+    def test_upload_auto_detects_content_type_from_extension(
+        self, bucket: Bucket, tmp_path: Path
+    ) -> None:
+        """Content type is guessed from the file extension when not provided."""
+        local = _write_local(tmp_path, "report.csv", b"a,b\n1,2")
+        bucket.upload(local, "upload/report.csv")
+        info = bucket.head("upload/report.csv")
+        assert "csv" in info.content_type or "text" in info.content_type
+
+    def test_upload_with_metadata(self, bucket: Bucket, tmp_path: Path) -> None:
+        """User-defined metadata set at upload time is retrievable via head()."""
+        local = _write_local(tmp_path, "doc.txt", b"content")
+        bucket.upload(local, "upload/doc.txt", metadata={"source": "pipeline", "ver": "3"})
+        info = bucket.head("upload/doc.txt")
+        assert info.metadata.get("source") == "pipeline"
+        assert info.metadata.get("ver") == "3"
+
+    def test_upload_with_tags(self, bucket: Bucket, tmp_path: Path) -> None:
+        """Tags set at upload time are stored and retrievable."""
+        local = _write_local(tmp_path, "tagged.txt", b"data")
+        bucket.upload(local, "upload/tagged.txt", tags={"env": "test", "owner": "ci"})
+        tags = bucket.get_tags("upload/tagged.txt")
+        assert tags.get("env") == "test"
+        assert tags.get("owner") == "ci"
+
     def test_upload_empty_key_raises(self, bucket: Bucket, tmp_path: Path) -> None:
         """An empty key raises ValidationError before touching S3."""
         local = _write_local(tmp_path, "f.txt", b"x")

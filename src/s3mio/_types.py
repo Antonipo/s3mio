@@ -8,6 +8,36 @@ from typing import Any, Iterator, Protocol, runtime_checkable
 
 
 @dataclass
+class DeleteResult:
+    """Result returned by :meth:`Bucket.delete_many`.
+
+    Attributes:
+        deleted: Keys that S3 confirmed as successfully deleted.
+        failed:  Keys that S3 could not delete, as ``(key, error_code)`` pairs.
+                 Common causes: object-lock, versioning, insufficient permissions.
+
+    Example::
+
+        result = bucket.delete_many(keys)
+        if not result:                         # bool(result) is False when failures exist
+            for key, code in result.failed:
+                print(f"Failed to delete {key!r}: {code}")
+        print(f"Deleted {len(result)} objects")
+    """
+
+    deleted: list[str]
+    failed: list[tuple[str, str]]  # (key, error_code)
+
+    def __len__(self) -> int:
+        """Return the number of successfully deleted objects."""
+        return len(self.deleted)
+
+    def __bool__(self) -> bool:
+        """Return True when there are no failures."""
+        return not self.failed
+
+
+@dataclass
 class ObjectInfo:
     """Metadata for a single S3 object returned by :meth:`Bucket.list` or :meth:`Bucket.head`.
 
@@ -88,7 +118,7 @@ class PrefixProtocol(Protocol):
 
     def list(self) -> list[ObjectInfo]: ...
 
-    def delete_all(self) -> int: ...
+    def delete_all(self) -> "DeleteResult": ...
 
     def __truediv__(self, segment: str) -> "PrefixProtocol": ...
 

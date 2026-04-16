@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Generator, Iterator, List, Optional, cast
+from urllib.parse import urlencode
 
+import boto3.exceptions
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
-from ._types import ObjectInfo
+from ._types import DeleteResult, ObjectInfo
 from .exceptions import (
     AccessDeniedError,
     BucketNotFoundError,
@@ -50,7 +53,7 @@ def _map_client_error(
 ) -> S3Error:
     """Map a boto3 ClientError to the appropriate s3mio exception."""
     code = error.response["Error"]["Code"]
-    if code in ("NoSuchKey", "404"):
+    if code in ("NoSuchKey", "NotFound", "404"):
         return ObjectNotFoundError(key=key, bucket=bucket)
     if code == "NoSuchBucket":
         return BucketNotFoundError(bucket=bucket)
@@ -287,7 +290,7 @@ class Bucket:
             return True
         except ClientError as exc:
             code = exc.response["Error"]["Code"]
-            if code in ("404", "NoSuchKey"):
+            if code in ("404", "NoSuchKey", "NotFound"):
                 return False
             raise _map_client_error(exc, key, self._name, "head") from exc
 
@@ -365,6 +368,9 @@ class Bucket:
         local_path: str | Path,
         key: str,
         on_progress: Optional[Callable[[float], None]] = None,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+        tags: Optional[dict[str, str]] = None,
     ) -> None:
         """Upload a local file to S3.
 
@@ -372,14 +378,23 @@ class Bucket:
         splitting it into parallel parts for faster transfers. This is
         completely transparent — no extra configuration needed.
 
-        Args:
-            local_path:  Path to the local file (str or :class:`pathlib.Path`).
-            key:         Destination S3 key.
-            on_progress: Optional callback invoked periodically with the
-                         current upload percentage (0.0 – 100.0). Example::
+        Retry for upload is managed by the boto3 TransferManager (part-level
+        retry), not by s3mio's ``max_retries`` / ``retry_delay`` settings.
 
-                             bucket.upload("video.mp4", "media/video.mp4",
-                                           on_progress=lambda p: print(f"{p:.0f}%"))
+        Args:
+            local_path:   Path to the local file (str or :class:`pathlib.Path`).
+            key:          Destination S3 key.
+            on_progress:  Optional callback invoked periodically with the
+                          current upload percentage (0.0 – 100.0). Example::
+
+                              bucket.upload("video.mp4", "media/video.mp4",
+                                            on_progress=lambda p: print(f"{p:.0f}%"))
+            content_type: MIME type for the object. When omitted, the type is
+                          guessed from the file extension (e.g. ``"text/csv"``
+                          for ``.csv`` files), falling back to
+                          ``application/octet-stream``.
+            metadata:     User-defined string metadata (max 2 KB).
+            tags:         Object tags as ``{key: value}`` pairs.
 
         Raises:
             ValidationError:     If *key* is empty or the local file does not exist.
@@ -389,12 +404,17 @@ class Bucket:
 
         Example::
 
-            # Simple upload
+            # Simple upload — content type auto-detected as text/csv
             bucket.upload("data/report.csv", "reports/2025/report.csv")
 
-            # With progress bar
-            bucket.upload("backup.tar.gz", "backups/backup.tar.gz",
-                          on_progress=lambda pct: print(f"\\r{pct:.1f}%", end=""))
+            # With explicit type, metadata, tags, and progress
+            bucket.upload(
+                "backup.tar.gz", "backups/backup.tar.gz",
+                content_type="application/gzip",
+                metadata={"source": "nightly-job"},
+                tags={"env": "prod"},
+                on_progress=lambda pct: print(f"\\r{pct:.1f}%", end=""),
+            )
         """
         if not key:
             raise ValidationError("Object key must not be empty.")
@@ -404,6 +424,17 @@ class Bucket:
             raise ValidationError(f"Local file not found: {local_path}")
         if not local_path.is_file():
             raise ValidationError(f"Path is not a file: {local_path}")
+
+        # Resolve content type: explicit > guessed from extension > binary fallback
+        if content_type is None:
+            guessed, _ = mimetypes.guess_type(str(local_path))
+            content_type = guessed or _CONTENT_TYPE_BINARY
+
+        extra_args: dict[str, Any] = {"ContentType": content_type}
+        if metadata:
+            extra_args["Metadata"] = metadata
+        if tags:
+            extra_args["Tagging"] = urlencode(tags)
 
         config = TransferConfig(multipart_threshold=_MULTIPART_THRESHOLD)
 
@@ -421,11 +452,11 @@ class Bucket:
             callback = _progress_callback
 
         try:
-            self._call(
-                self._s3.client.upload_file,
+            self._s3.client.upload_file(
                 str(local_path),
                 self._name,
                 key,
+                ExtraArgs=extra_args,
                 Config=config,
                 Callback=callback,
             )
@@ -466,7 +497,7 @@ class Bucket:
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            self._call(self._s3.client.download_file, self._name, key, str(local_path))
+            self._s3.client.download_file(self._name, key, str(local_path))
             logger.debug("download s3://%s/%s → %s", self._name, key, local_path)
         except ClientError as exc:
             raise _map_client_error(exc, key, self._name, "download") from exc
@@ -590,50 +621,67 @@ class Bucket:
     # Batch operations — delete_many / copy / copy_many
     # ------------------------------------------------------------------
 
-    def delete_many(self, keys: List[str]) -> int:
+    def delete_many(self, keys: List[str]) -> DeleteResult:
         """Delete multiple objects in a single bulk operation.
 
         S3 supports up to 1000 keys per ``DeleteObjects`` call. When *keys*
         exceeds that limit, s3mio automatically splits it into chunks and
-        issues multiple requests.
+        issues multiple requests. Per-object failures (e.g. caused by
+        object-lock or versioning) are collected and returned in the result
+        rather than raising an exception, so the caller can inspect exactly
+        which keys succeeded and which did not.
 
         Args:
             keys: List of S3 keys to delete. Empty list is a no-op.
 
         Returns:
-            Total number of objects deleted.
+            A :class:`DeleteResult` with ``deleted`` (successful keys) and
+            ``failed`` (``(key, error_code)`` pairs for any S3 rejections).
+            ``len(result)`` gives the successful count; ``bool(result)`` is
+            ``False`` when any failures occurred.
 
         Raises:
             BucketNotFoundError: If the bucket does not exist.
             AccessDeniedError:   If the caller lacks ``s3:DeleteObject`` permission.
-            S3OperationError:    For any other AWS error.
+            S3OperationError:    For any other bucket-level AWS error.
 
         Example::
 
-            deleted = bucket.delete_many(["tmp/a.json", "tmp/b.json", "tmp/c.json"])
-            print(f"Removed {deleted} objects")
+            result = bucket.delete_many(["tmp/a.json", "tmp/b.json", "tmp/c.json"])
+            print(f"Removed {len(result)} objects")
+            if not result:
+                for key, code in result.failed:
+                    print(f"  Could not delete {key!r}: {code}")
         """
         if not keys:
-            return 0
+            return DeleteResult(deleted=[], failed=[])
 
-        deleted_count = 0
+        all_deleted: list[str] = []
+        all_failed: list[tuple[str, str]] = []
+
         for i in range(0, len(keys), _BULK_DELETE_LIMIT):
             chunk = keys[i : i + _BULK_DELETE_LIMIT]
             payload = {"Objects": [{"Key": k} for k in chunk], "Quiet": True}
             try:
-                self._call(self._s3.client.delete_objects, Bucket=self._name, Delete=payload)
-                deleted_count += len(chunk)
+                response = self._call(
+                    self._s3.client.delete_objects, Bucket=self._name, Delete=payload
+                )
+                chunk_errors = response.get("Errors", [])
+                failed_keys = {e["Key"] for e in chunk_errors}
+                all_deleted.extend(k for k in chunk if k not in failed_keys)
+                all_failed.extend((e["Key"], e["Code"]) for e in chunk_errors)
                 logger.debug(
-                    "delete_many s3://%s — deleted %d objects (chunk %d-%d)",
+                    "delete_many s3://%s — deleted %d, failed %d (chunk %d-%d)",
                     self._name,
-                    len(chunk),
+                    len(chunk) - len(chunk_errors),
+                    len(chunk_errors),
                     i,
                     i + len(chunk),
                 )
             except ClientError as exc:
                 raise _map_client_error(exc, chunk[0], self._name, "delete_many") from exc
 
-        return deleted_count
+        return DeleteResult(deleted=all_deleted, failed=all_failed)
 
     def copy(
         self,
@@ -676,12 +724,10 @@ class Bucket:
         copy_source = {"Bucket": self._name, "Key": src_key}
 
         try:
-            self._call(
-                self._s3.client.copy_object,
-                CopySource=copy_source,
-                Bucket=target_bucket,
-                Key=dest_key,
-            )
+            # client.copy() is the high-level TransferManager call — it handles
+            # multipart copy automatically for objects > 5 GB (unlike copy_object).
+            # Retry at the part level is managed by botocore, not _call().
+            self._s3.client.copy(copy_source, target_bucket, dest_key)
             logger.debug(
                 "copy s3://%s/%s → s3://%s/%s",
                 self._name,
@@ -691,6 +737,11 @@ class Bucket:
             )
         except ClientError as exc:
             raise _map_client_error(exc, src_key, self._name, "copy") from exc
+        except boto3.exceptions.S3UploadFailedError as exc:
+            raise S3OperationError(
+                f"Multipart copy failed for s3://{self._name}/{src_key}: {exc}",
+                error_code="MultipartCopyFailed",
+            ) from exc
 
     def copy_many(
         self,
@@ -1074,38 +1125,40 @@ class Prefix:
         """
         return self._bucket.list(prefix=self._path)
 
-    def delete_all(self) -> int:
+    def delete_all(self) -> DeleteResult:
         """Delete every object under this prefix.
 
         Delegates to :meth:`Bucket.delete_many` for efficient bulk deletion
         (up to 1000 keys per S3 call).
 
         Returns:
-            Number of objects deleted.
+            A :class:`DeleteResult` with ``deleted`` and ``failed`` key lists.
+            ``len(result)`` gives the successful count; ``bool(result)`` is
+            ``False`` when any per-object failures occurred.
 
         Example::
 
-            deleted = (bucket / "tmp").delete_all()
-            print(f"Cleaned up {deleted} objects")
+            result = (bucket / "tmp").delete_all()
+            print(f"Cleaned up {len(result)} objects")
         """
         keys = [obj.key for obj in self.list()]
         if not keys:
-            return 0
+            return DeleteResult(deleted=[], failed=[])
 
-        deleted = self._bucket.delete_many(keys)
+        result = self._bucket.delete_many(keys)
         logger.debug(
             "delete_all s3://%s/%s* — deleted %d objects",
             self._bucket.name,
             self._path,
-            deleted,
+            len(result),
         )
-        return deleted
+        return result
 
     # ------------------------------------------------------------------
     # Batch operations — delete_many / copy / copy_many
     # ------------------------------------------------------------------
 
-    def delete_many(self, keys: List[str]) -> int:
+    def delete_many(self, keys: List[str]) -> DeleteResult:
         """Delete multiple objects under this prefix in bulk.
 
         Each key in *keys* is treated as relative to this prefix — the full
@@ -1115,17 +1168,18 @@ class Prefix:
             keys: Relative key names to delete. Empty list is a no-op.
 
         Returns:
-            Number of objects deleted.
+            A :class:`DeleteResult` with ``deleted`` and ``failed`` key lists.
+            See :meth:`Bucket.delete_many` for full details.
 
         Raises:
             BucketNotFoundError: If the bucket does not exist.
             AccessDeniedError:   If the caller lacks ``s3:DeleteObject`` permission.
-            S3OperationError:    For any other AWS error.
+            S3OperationError:    For any other bucket-level AWS error.
 
         Example::
 
             folder = bucket / "tmp"
-            folder.delete_many(["cache1.json", "cache2.json"])
+            result = folder.delete_many(["cache1.json", "cache2.json"])
             # deletes: tmp/cache1.json, tmp/cache2.json
         """
         full_keys = [self._full_key(k) for k in keys]
