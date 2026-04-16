@@ -266,6 +266,25 @@ except AccessDeniedError as exc:
     print(f"permission denied: {exc}")
 ```
 
+## Development
+
+```bash
+git clone https://github.com/Antonipo/s3mio.git
+cd s3mio
+uv pip install -e ".[dev]"
+
+# lint
+uv run ruff check src/
+
+# type check
+uv run mypy src/s3mio/
+
+# tests
+uv run pytest --cov=s3mio
+```
+
+Tests use [moto](https://github.com/getmoto/moto) to mock AWS — no real credentials needed.
+
 ## Requirements
 
 - Python 3.10+
