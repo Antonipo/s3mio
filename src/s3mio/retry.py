@@ -15,7 +15,7 @@ from botocore.exceptions import (
     ReadTimeoutError,
 )
 
-logger = logging.getLogger("s3mio")
+logger = logging.getLogger(__name__)
 
 # Error codes that are transient and safe to retry
 _RETRYABLE_CODES: frozenset[str] = frozenset(
@@ -118,4 +118,4 @@ def call_with_retry(
                 delay,
             )
             time.sleep(delay)
-    return None  # unreachable — satisfies mypy
+    raise RuntimeError("unreachable: loop must have returned or raised")  # pragma: no cover

@@ -30,7 +30,7 @@ from .retry import _RETRYABLE_NETWORK_ERRORS, call_with_retry
 if TYPE_CHECKING:
     from .client import S3
 
-logger = logging.getLogger("s3mio")
+logger = logging.getLogger(__name__)
 
 # MIME types used in put() smart detection
 _CONTENT_TYPE_JSON = "application/json"
@@ -254,6 +254,10 @@ class Bucket:
 
     def delete(self, key: str) -> None:
         """Delete a single object.
+
+        This operation is idempotent: deleting a key that does not exist returns
+        normally without raising ``ObjectNotFoundError`` — S3 responds with HTTP 204
+        regardless of whether the object existed.
 
         Args:
             key: S3 key to delete.
@@ -1076,10 +1080,17 @@ class Bucket:
         - ``"GET"``  — allows downloading the object (default).
         - ``"PUT"``  — allows uploading / replacing the object.
 
+        **S3 Express One Zone caveat:** presigned URLs for Express buckets use
+        short-lived session credentials internally. The effective maximum
+        ``expires_in`` is bounded by the credential session duration (typically
+        under one hour), even if a longer value is passed. URLs that exceed that
+        bound will be rejected by S3 when used.
+
         Args:
             key:        S3 key of the object.
             expires_in: URL validity in seconds (default: 3600 = 1 hour).
-                        Minimum: 1. Maximum: 604800 (7 days) for most configurations.
+                        Minimum: 1. Maximum: 604800 (7 days) for standard buckets;
+                        lower for S3 Express One Zone (see caveat above).
             method:     HTTP method the URL will grant. Must be ``"GET"`` or ``"PUT"``.
 
         Returns:
@@ -1688,8 +1699,6 @@ def _serialize(data: Any) -> tuple[bytes, str]:
 
 def _encode_tags(tags: dict[str, str]) -> str:
     """Encode a tags dict as a URL query string for S3 Tagging."""
-    from urllib.parse import urlencode
-
     return urlencode(tags)
 
 

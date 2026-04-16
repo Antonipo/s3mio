@@ -6,11 +6,19 @@ import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import boto3
+import botocore.config
+
+try:
+    from importlib.metadata import version as _pkg_version
+
+    _UA = f"s3mio/{_pkg_version('s3mio')}"
+except Exception:
+    _UA = "s3mio/dev"
 
 if TYPE_CHECKING:
     from .bucket import Bucket
 
-logger = logging.getLogger("s3mio")
+logger = logging.getLogger(__name__)
 
 # Suffix used by S3 Express One Zone bucket names (e.g. "my-bucket--use1-az4--x-s3")
 _EXPRESS_SUFFIX = "--x-s3"
@@ -77,8 +85,9 @@ class S3:
             aws_session_token=aws_session_token,
             **session_kwargs,
         )
+        _config = botocore.config.Config(user_agent_extra=_UA)
         self._resource = self._session.resource("s3", endpoint_url=endpoint_url)
-        self._client = self._session.client("s3", endpoint_url=endpoint_url)
+        self._client = self._session.client("s3", endpoint_url=endpoint_url, config=_config)
         logger.debug("S3 client initialized (region=%s)", region_name)
 
     @property
@@ -105,6 +114,19 @@ class S3:
     def max_retry_delay(self) -> float:
         """Maximum sleep cap in seconds between retries."""
         return self._max_retry_delay
+
+    def close(self) -> None:
+        """Close the underlying boto3 client and release connection pool resources.
+
+        Called automatically when used as a context manager (``with S3(...) as s3``).
+        """
+        self._client.close()
+
+    def __enter__(self) -> "S3":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
 
     def bucket(self, name: str) -> "Bucket":  # noqa: F821
         """Return a Bucket wrapper for the given bucket name.

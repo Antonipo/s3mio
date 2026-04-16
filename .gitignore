@@ -10,3 +10,10 @@ docs/
 
 # Virtual environments
 .venv
+
+# Test / coverage artefacts
+.coverage
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
