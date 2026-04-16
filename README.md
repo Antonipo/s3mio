@@ -1,5 +1,9 @@
 # s3mio
 
+[![Tests](https://github.com/Antonipo/s3mio/actions/workflows/tests.yml/badge.svg)](https://github.com/Antonipo/s3mio/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/s3mio)](https://pypi.org/project/s3mio/)
+[![Coverage](https://codecov.io/gh/Antonipo/s3mio/branch/main/graph/badge.svg)](https://codecov.io/gh/Antonipo/s3mio)
+
 Pythonic S3 wrapper for AWS — clean, typed API over boto3.
 
 ```python

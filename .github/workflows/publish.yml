@@ -1,0 +1,38 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv venv --python 3.12
+
+      - name: Install dependencies
+        run: uv pip install -e ".[dev]"
+
+      - name: Lint
+        run: uv run ruff check src/
+
+      - name: Type check
+        run: uv run mypy src/s3mio/
+
+      - name: Tests
+        run: uv run pytest
+
+      - name: Build
+        run: uvx --from build pyproject-build
+
+      - name: Publish to PyPI
+        run: uvx twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
