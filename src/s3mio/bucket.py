@@ -5,16 +5,18 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Generator, Iterator, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Generator, Iterator, List, Optional
 from urllib.parse import urlencode
 
 import boto3.exceptions
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 
-from ._types import DeleteResult, ObjectInfo
+from ._types import CopyResult, DeleteResult, ObjectInfo
 from .exceptions import (
     AccessDeniedError,
     BucketNotFoundError,
@@ -23,7 +25,7 @@ from .exceptions import (
     S3OperationError,
     ValidationError,
 )
-from .retry import call_with_retry
+from .retry import _RETRYABLE_NETWORK_ERRORS, call_with_retry
 
 if TYPE_CHECKING:
     from .client import S3
@@ -87,14 +89,12 @@ class Bucket:
         self._s3 = s3
         self._express = express
         self._boto_bucket = s3.resource.Bucket(name)
-        self._max_retries: int = s3.max_retries
-        self._retry_delay: float = s3.retry_delay
 
     def _call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute *func* with exponential-backoff retry on transient S3 errors.
 
-        Delegates to :func:`~s3mio.retry.call_with_retry` using this bucket's
-        retry configuration (``_max_retries`` and ``_retry_delay``).
+        Delegates to :func:`~s3mio.retry.call_with_retry` using the live
+        retry configuration from the parent :class:`~s3mio.client.S3` instance.
 
         Args:
             func:     The boto3 callable to invoke.
@@ -104,7 +104,14 @@ class Bucket:
         Returns:
             The return value of *func*.
         """
-        return call_with_retry(func, self._max_retries, self._retry_delay, *args, **kwargs)
+        return call_with_retry(
+            func,
+            self._s3.max_retries,
+            self._s3.retry_delay,
+            *args,
+            max_delay=self._s3.max_retry_delay,
+            **kwargs,
+        )
 
     @property
     def name(self) -> str:
@@ -298,6 +305,57 @@ class Bucket:
     # List
     # ------------------------------------------------------------------
 
+    def iter_list(
+        self,
+        prefix: str = "",
+        delimiter: str = "",
+        max_keys: int = 1000,
+    ) -> Iterator[ObjectInfo]:
+        """Yield objects one at a time without buffering all pages in memory.
+
+        Useful for buckets with millions of objects where loading the full
+        result set would exhaust RAM. For a sorted, materialised list use
+        :meth:`list` instead.
+
+        Args:
+            prefix:    Key prefix filter (e.g. ``"logs/"``).
+            delimiter: Hierarchy delimiter (e.g. ``"/"`` to simulate folders).
+            max_keys:  Page size for each ListObjectsV2 call (default 1000).
+
+        Yields:
+            :class:`ObjectInfo` instances in the order S3 returns them
+            (lexicographic within each page; no global sort guarantee).
+
+        Raises:
+            BucketNotFoundError: If the bucket does not exist.
+            AccessDeniedError:   If the caller lacks ``s3:ListBucket`` permission.
+            S3OperationError:    For any other AWS error.
+
+        Example::
+
+            for obj in bucket.iter_list(prefix="users/"):
+                process(obj)
+        """
+        params: dict[str, Any] = {"Bucket": self._name, "MaxKeys": max_keys}
+        if prefix:
+            params["Prefix"] = prefix
+        if delimiter:
+            params["Delimiter"] = delimiter
+
+        paginator = self._s3.client.get_paginator("list_objects_v2")
+        try:
+            for page in paginator.paginate(**params):
+                for obj in page.get("Contents", []):
+                    yield ObjectInfo(
+                        key=obj["Key"],
+                        size=obj["Size"],
+                        last_modified=obj["LastModified"],
+                        etag=obj["ETag"].strip('"'),
+                        storage_class=obj.get("StorageClass", "STANDARD"),
+                    )
+        except ClientError as exc:
+            raise _map_client_error(exc, prefix, self._name, "list") from exc
+
     def list(
         self,
         prefix: str = "",
@@ -306,8 +364,9 @@ class Bucket:
     ) -> list[ObjectInfo]:
         """List objects in the bucket, optionally filtered by prefix.
 
-        Paginates automatically — returns all matching keys up to *max_keys*
-        per page (AWS limit), collecting all pages.
+        Paginates automatically and returns all matching keys sorted by key
+        name. For large buckets where you want to process objects without
+        buffering everything in memory, use :meth:`iter_list` instead.
 
         Args:
             prefix:    Key prefix filter (e.g. ``"logs/"``).
@@ -328,36 +387,10 @@ class Bucket:
             for obj in objects:
                 print(obj.key, obj.size)
         """
-        params: dict[str, Any] = {
-            "Bucket": self._name,
-            "MaxKeys": max_keys,
-        }
-        if prefix:
-            params["Prefix"] = prefix
-        if delimiter:
-            params["Delimiter"] = delimiter
-
-        def _fetch_all_pages() -> list[ObjectInfo]:
-            """Paginate list_objects_v2 and collect all results."""
-            items: list[ObjectInfo] = []
-            paginator = self._s3.client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(**params):
-                for obj in page.get("Contents", []):
-                    items.append(
-                        ObjectInfo(
-                            key=obj["Key"],
-                            size=obj["Size"],
-                            last_modified=obj["LastModified"],
-                            etag=obj["ETag"].strip('"'),
-                            storage_class=obj.get("StorageClass", "STANDARD"),
-                        )
-                    )
-            return items
-
-        try:
-            return cast(list[ObjectInfo], self._call(_fetch_all_pages))
-        except ClientError as exc:
-            raise _map_client_error(exc, prefix, self._name, "list") from exc
+        return sorted(
+            self.iter_list(prefix=prefix, delimiter=delimiter, max_keys=max_keys),
+            key=lambda o: o.key,
+        )
 
     # ------------------------------------------------------------------
     # File I/O — upload / download
@@ -573,31 +606,34 @@ class Bucket:
         the object is fully consumed. Useful for large binary files (videos,
         archives, model weights) that must not be loaded entirely into memory.
 
+        Validation and the initial ``GetObject`` call happen *eagerly* (before
+        the first iteration), so errors are raised immediately rather than on
+        the first ``next()`` call.
+
+        If the connection drops mid-stream, s3mio transparently reconnects
+        using a ``Range`` header starting from the last successfully received
+        byte, retrying up to ``max_retries`` times with exponential backoff.
+
         Args:
             key:        S3 key of the object.
             chunk_size: Number of bytes per chunk (default: 8 MB).
 
-        Yields:
-            ``bytes`` chunks of at most *chunk_size* bytes each.
+        Returns:
+            An iterator of ``bytes`` chunks of at most *chunk_size* bytes each.
             The last chunk may be smaller if the object size is not a
             multiple of *chunk_size*.
 
         Raises:
-            ValidationError:     If *key* is empty.
-            ObjectNotFoundError: If the key does not exist.
+            ValidationError:     If *key* is empty (raised immediately).
+            ObjectNotFoundError: If the key does not exist (raised immediately).
             AccessDeniedError:   If the caller lacks ``s3:GetObject`` permission.
             S3OperationError:    For any other AWS error.
 
         Example::
 
-            # Re-upload a large file to another bucket in chunks
             with open("local_copy.bin", "wb") as f:
                 for chunk in bucket.stream("backups/large.bin", chunk_size=16 * 1024 * 1024):
                     f.write(chunk)
-
-            # Process a binary stream
-            for chunk in bucket.stream("data/embeddings.bin"):
-                process_chunk(chunk)
         """
         if not key:
             raise ValidationError("Object key must not be empty.")
@@ -607,15 +643,58 @@ class Bucket:
         except ClientError as exc:
             raise _map_client_error(exc, key, self._name, "stream") from exc
 
-        body = response["Body"]
-        try:
-            while True:
-                chunk = body.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            body.close()
+        # Return a plain generator — validation and GetObject already ran eagerly above.
+        return self._stream_body(key, response["Body"], chunk_size)
+
+    def _stream_body(self, key: str, body: Any, chunk_size: int) -> Iterator[bytes]:
+        """Yield chunks from *body*, reconnecting on transient network errors.
+
+        On a network interruption the body is closed and re-opened with a
+        ``Range: bytes=<bytes_read>-`` header so transfer resumes from exactly
+        where it left off. Retries follow the same exponential-backoff policy
+        as ``_call()``, capped at ``max_retry_delay``.
+        """
+        bytes_read = 0
+        attempt = 0
+        max_retries = self._s3.max_retries
+
+        while True:
+            try:
+                while True:
+                    chunk = body.read(chunk_size)
+                    if not chunk:
+                        body.close()
+                        return
+                    bytes_read += len(chunk)
+                    yield chunk
+            except _RETRYABLE_NETWORK_ERRORS as exc:
+                body.close()
+                if attempt >= max_retries:
+                    raise
+                attempt += 1
+                delay = min(
+                    self._s3.retry_delay * (2 ** (attempt - 1)),
+                    self._s3.max_retry_delay,
+                )
+                logger.warning(
+                    "stream interrupted at byte %d (%s), reconnecting (%d/%d) in %.2fs",
+                    bytes_read,
+                    type(exc).__name__,
+                    attempt,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                try:
+                    response = self._s3.client.get_object(
+                        Bucket=self._name, Key=key, Range=f"bytes={bytes_read}-"
+                    )
+                    body = response["Body"]
+                except ClientError as reopen_exc:
+                    raise _map_client_error(reopen_exc, key, self._name, "stream") from reopen_exc
+            except BaseException:
+                body.close()
+                raise
 
     # ------------------------------------------------------------------
     # Batch operations — delete_many / copy / copy_many
@@ -747,51 +826,86 @@ class Bucket:
         self,
         pairs: List[tuple[str, str]],
         dest_bucket: Optional[str] = None,
-    ) -> int:
-        """Copy multiple objects in sequence.
+        max_workers: int = 1,
+    ) -> CopyResult:
+        """Copy multiple objects, collecting per-pair success and failure.
 
         Each pair is ``(src_key, dest_key)``. If *dest_bucket* is omitted,
-        all copies stay within this bucket.
+        all copies stay within this bucket. Failed pairs are collected into
+        :attr:`CopyResult.failed` rather than raising immediately, so the
+        caller can inspect what succeeded, what did not, and retry selectively.
 
-        S3 has no native batch-copy API, so this method issues one
-        ``CopyObject`` call per pair. For very large lists consider running
-        this in a background thread.
+        S3 has no native batch-copy API, so each pair maps to one
+        ``CopyObject`` call (or a multipart copy for objects > 5 GB).
+        Set *max_workers* > 1 to issue calls concurrently via a thread pool —
+        latency is the bottleneck, so even a small pool (e.g. ``max_workers=8``)
+        gives large speed-ups on long lists.
 
         Args:
             pairs:       List of ``(src_key, dest_key)`` tuples.
             dest_bucket: Destination bucket for all pairs. Defaults to this bucket.
+            max_workers: Number of concurrent copy threads (default: 1 — sequential).
+                         Values > 1 use :class:`~concurrent.futures.ThreadPoolExecutor`.
 
         Returns:
-            Number of objects successfully copied.
-
-        Raises:
-            ValidationError:     If any key in *pairs* is empty.
-            ObjectNotFoundError: If a source key does not exist.
-            BucketNotFoundError: If the destination bucket does not exist.
-            AccessDeniedError:   If the caller lacks ``s3:CopyObject`` permission.
-            S3OperationError:    For any other AWS error.
+            A :class:`CopyResult` with ``done`` (successful pairs) and ``failed``
+            (``(src_key, dest_key, error_message)`` triples). ``len(result)``
+            gives the successful count; ``bool(result)`` is ``False`` when any
+            failures occurred. Use ``result.failed_pairs()`` to retry the failures.
 
         Example::
 
-            bucket.copy_many([
+            result = bucket.copy_many([
                 ("raw/jan.csv",  "processed/jan.csv"),
                 ("raw/feb.csv",  "processed/feb.csv"),
-                ("raw/mar.csv",  "processed/mar.csv"),
             ])
+            if not result:
+                bucket.copy_many(result.failed_pairs())
 
-            # Cross-bucket batch copy
-            bucket.copy_many(
+            # Cross-bucket parallel copy
+            result = bucket.copy_many(
                 [("exports/users.csv", "users.csv")],
                 dest_bucket="analytics-bucket",
+                max_workers=8,
             )
         """
         if not pairs:
-            return 0
+            return CopyResult(done=[], failed=[])
 
-        for src_key, dest_key in pairs:
-            self.copy(src_key, dest_key, dest_bucket=dest_bucket)
+        done: list[tuple[str, str]] = []
+        failed: list[tuple[str, str, str]] = []
 
-        return len(pairs)
+        if max_workers == 1:
+            for src_key, dest_key in pairs:
+                try:
+                    self.copy(src_key, dest_key, dest_bucket=dest_bucket)
+                    done.append((src_key, dest_key))
+                except Exception as exc:
+                    failed.append((src_key, dest_key, str(exc)))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_pair = {
+                    executor.submit(self.copy, src_key, dest_key, dest_bucket=dest_bucket): (
+                        src_key,
+                        dest_key,
+                    )
+                    for src_key, dest_key in pairs
+                }
+                for future in as_completed(future_to_pair):
+                    src_key, dest_key = future_to_pair[future]
+                    try:
+                        future.result()
+                        done.append((src_key, dest_key))
+                    except Exception as exc:
+                        failed.append((src_key, dest_key, str(exc)))
+
+        logger.debug(
+            "copy_many s3://%s — done %d, failed %d",
+            self._name,
+            len(done),
+            len(failed),
+        )
+        return CopyResult(done=done, failed=failed)
 
     # ------------------------------------------------------------------
     # Tags — set_tags / get_tags
@@ -884,7 +998,7 @@ class Bucket:
     # Head — object inspection without body download
     # ------------------------------------------------------------------
 
-    def head(self, key: str) -> ObjectInfo:
+    def head(self, key: str, *, with_tags: bool = False) -> ObjectInfo:
         """Return full metadata for an object without downloading its body.
 
         Unlike :meth:`get_bytes`, ``head()`` only fetches HTTP headers, making
@@ -893,10 +1007,13 @@ class Bucket:
 
         The returned :class:`ObjectInfo` includes all fields, including
         ``content_type`` and ``metadata``, which are *not* populated by
-        :meth:`list`.
+        :meth:`list`. Pass ``with_tags=True`` to also populate
+        :attr:`~ObjectInfo.tags` via a second ``GetObjectTagging`` call.
 
         Args:
-            key: S3 key of the object to inspect.
+            key:       S3 key of the object to inspect.
+            with_tags: When ``True``, fetch and populate :attr:`ObjectInfo.tags`
+                       with a second API call (default: ``False``).
 
         Returns:
             A fully-populated :class:`ObjectInfo` instance.
@@ -913,7 +1030,9 @@ class Bucket:
             print(info.size)          # 204_800
             print(info.content_type)  # "application/pdf"
             print(info.metadata)      # {"author": "antonio", "version": "3"}
-            print(info.etag)          # "d41d8cd98f00b204e9800998ecf8427e"
+
+            info = bucket.head("reports/q1.pdf", with_tags=True)
+            print(info.tags)          # {"env": "prod", "owner": "data-team"}
         """
         if not key:
             raise ValidationError("Object key must not be empty.")
@@ -921,7 +1040,7 @@ class Bucket:
         try:
             resp = self._call(self._s3.client.head_object, Bucket=self._name, Key=key)
             logger.debug("head s3://%s/%s", self._name, key)
-            return ObjectInfo(
+            info = ObjectInfo(
                 key=key,
                 size=resp["ContentLength"],
                 last_modified=resp["LastModified"],
@@ -930,6 +1049,9 @@ class Bucket:
                 content_type=resp.get("ContentType", ""),
                 metadata=resp.get("Metadata", {}),
             )
+            if with_tags:
+                info.tags = self.get_tags(key)
+            return info
         except ClientError as exc:
             raise _map_client_error(exc, key, self._name, "head") from exc
 
@@ -1117,6 +1239,16 @@ class Prefix:
         """Check existence of an object under this prefix. See :meth:`Bucket.exists`."""
         return self._bucket.exists(self._full_key(key))
 
+    def iter_list(self) -> Iterator[ObjectInfo]:
+        """Yield objects under this prefix without buffering all results.
+
+        See :meth:`Bucket.iter_list` for full documentation.
+
+        Yields:
+            :class:`ObjectInfo` instances in S3's natural order.
+        """
+        yield from self._bucket.iter_list(prefix=self._path)
+
     def list(self) -> list[ObjectInfo]:
         """List all objects under this prefix.
 
@@ -1229,39 +1361,42 @@ class Prefix:
         self,
         pairs: List[tuple[str, str]],
         dest_bucket: Optional[str] = None,
-    ) -> int:
-        """Copy multiple objects within this prefix in sequence.
+        max_workers: int = 1,
+    ) -> CopyResult:
+        """Copy multiple objects within this prefix, collecting per-pair results.
 
         Each pair is ``(src_key, dest_key)`` where both are relative to this
-        prefix (unless *dest_bucket* is provided, in which case dest_key is
-        absolute in that bucket).
+        prefix (unless *dest_bucket* is provided, in which case *dest_key* is
+        an absolute key in that bucket).
+
+        Keys are expanded to their full S3 paths before delegating to
+        :meth:`Bucket.copy_many`, so :attr:`CopyResult.done` and
+        :attr:`CopyResult.failed` contain **full keys**, not relative ones.
 
         Args:
-            pairs:       List of ``(src_key, dest_key)`` tuples.
+            pairs:       List of ``(src_key, dest_key)`` tuples (relative keys).
             dest_bucket: Destination bucket for all copies. Defaults to same bucket.
+            max_workers: Concurrent copy threads (default: 1 — sequential).
 
         Returns:
-            Number of objects copied.
-
-        Raises:
-            ValidationError:     If any key is empty.
-            ObjectNotFoundError: If a source object does not exist.
-            BucketNotFoundError: If the destination bucket does not exist.
-            AccessDeniedError:   If the caller lacks ``s3:CopyObject`` permission.
-            S3OperationError:    For any other AWS error.
+            A :class:`CopyResult` with ``done`` and ``failed`` pairs.
+            Use ``result.failed_pairs()`` to retry the failures.
 
         Example::
 
             folder = bucket / "raw"
-            folder.copy_many([
+            result = folder.copy_many([
                 ("jan.csv", "jan_backup.csv"),
                 ("feb.csv", "feb_backup.csv"),
-            ])
-            # copies: raw/jan.csv → raw/jan_backup.csv, etc.
+            ], max_workers=4)
         """
-        for src_key, dest_key in pairs:
-            self.copy(src_key, dest_key, dest_bucket=dest_bucket)
-        return len(pairs)
+        if not pairs:
+            return CopyResult(done=[], failed=[])
+        full_pairs = [
+            (self._full_key(s), d if dest_bucket else self._full_key(d))
+            for s, d in pairs
+        ]
+        return self._bucket.copy_many(full_pairs, dest_bucket=dest_bucket, max_workers=max_workers)
 
     # ------------------------------------------------------------------
     # Tags — set_tags / get_tags
@@ -1312,6 +1447,9 @@ class Prefix:
         local_path: str | Path,
         key: str,
         on_progress: Optional[Callable[[float], None]] = None,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+        tags: Optional[dict[str, str]] = None,
     ) -> None:
         """Upload a local file under this prefix.
 
@@ -1319,9 +1457,12 @@ class Prefix:
         for full parameter documentation and multipart behaviour.
 
         Args:
-            local_path:  Path to the local file (str or :class:`pathlib.Path`).
-            key:         Relative filename within this prefix.
-            on_progress: Optional callback with upload percentage (0.0–100.0).
+            local_path:   Path to the local file (str or :class:`pathlib.Path`).
+            key:          Relative filename within this prefix.
+            on_progress:  Optional callback with upload percentage (0.0–100.0).
+            content_type: MIME type override. Auto-detected from extension when omitted.
+            metadata:     User-defined string metadata (max 2 KB).
+            tags:         Object tags as ``{key: value}`` pairs.
 
         Example::
 
@@ -1330,7 +1471,14 @@ class Prefix:
                           on_progress=lambda p: print(f"{p:.0f}%"))
             # S3 key: backups/2025/nightly.tar.gz
         """
-        self._bucket.upload(local_path, self._full_key(key), on_progress=on_progress)
+        self._bucket.upload(
+            local_path,
+            self._full_key(key),
+            on_progress=on_progress,
+            content_type=content_type,
+            metadata=metadata,
+            tags=tags,
+        )
 
     def download(
         self,
@@ -1414,7 +1562,7 @@ class Prefix:
     # Head — object inspection without body download
     # ------------------------------------------------------------------
 
-    def head(self, key: str) -> ObjectInfo:
+    def head(self, key: str, *, with_tags: bool = False) -> ObjectInfo:
         """Return full metadata for an object under this prefix.
 
         See :meth:`Bucket.head` for full documentation. The returned
@@ -1422,7 +1570,8 @@ class Prefix:
         in addition to the standard list fields.
 
         Args:
-            key: Relative filename within this prefix.
+            key:       Relative filename within this prefix.
+            with_tags: When ``True``, also populate :attr:`ObjectInfo.tags`.
 
         Returns:
             A fully-populated :class:`ObjectInfo` instance.
@@ -1436,11 +1585,10 @@ class Prefix:
         Example::
 
             folder = bucket / "reports"
-            info = folder.head("q1.pdf")
-            print(info.size, info.content_type)
-            # reads head from: reports/q1.pdf
+            info = folder.head("q1.pdf", with_tags=True)
+            print(info.size, info.content_type, info.tags)
         """
-        return self._bucket.head(self._full_key(key))
+        return self._bucket.head(self._full_key(key), with_tags=with_tags)
 
     # ------------------------------------------------------------------
     # Presigned URLs — temporary access without credentials
@@ -1560,5 +1708,5 @@ def _iter_lines(body: Any, encoding: str) -> Iterator[str]:
     Yields:
         Decoded text lines without trailing newline characters.
     """
-    for raw_line in body.iter_lines():
+    for raw_line in body.iter_lines(chunk_size=64 * 1024):
         yield raw_line.decode(encoding).rstrip("\r\n")

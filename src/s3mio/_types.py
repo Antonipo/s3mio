@@ -8,6 +8,45 @@ from typing import Any, Iterator, Protocol, runtime_checkable
 
 
 @dataclass
+class CopyResult:
+    """Result returned by :meth:`Bucket.copy_many`.
+
+    Each element is the complete pair ``(src_key, dest_key)`` — the atomic
+    unit of a copy operation — so the caller never has to reconstruct the
+    mapping from a single-key list.
+
+    Attributes:
+        done:   Pairs that S3 confirmed as successfully copied.
+        failed: Pairs that could not be copied, as
+                ``(src_key, dest_key, error_message)`` triples.
+
+    Example::
+
+        result = bucket.copy_many(pairs)
+        if not result:
+            for src, dest, err in result.failed:
+                print(f"  {src!r} → {dest!r} failed: {err}")
+        # Retry just the failed ones:
+        bucket.copy_many(result.failed_pairs())
+    """
+
+    done: list[tuple[str, str]]           # (src_key, dest_key)
+    failed: list[tuple[str, str, str]]    # (src_key, dest_key, error_message)
+
+    def __len__(self) -> int:
+        """Return the number of successfully copied pairs."""
+        return len(self.done)
+
+    def __bool__(self) -> bool:
+        """Return True when there are no failures."""
+        return not self.failed
+
+    def failed_pairs(self) -> list[tuple[str, str]]:
+        """Return ``(src_key, dest_key)`` pairs for all failures, ready to retry."""
+        return [(s, d) for s, d, _ in self.failed]
+
+
+@dataclass
 class DeleteResult:
     """Result returned by :meth:`Bucket.delete_many`.
 
@@ -59,6 +98,8 @@ class ObjectInfo:
         metadata:      User-defined metadata key-value pairs set at upload time.
                        Empty dict when returned from ``list()`` — use ``head()``
                        to retrieve this field.
+        tags:          Object tags as ``{key: value}`` pairs.
+                       Empty dict unless ``head(key, with_tags=True)`` is used.
     """
 
     key: str
@@ -68,6 +109,7 @@ class ObjectInfo:
     storage_class: str
     content_type: str = ""
     metadata: dict[str, str] = field(default_factory=dict)
+    tags: dict[str, str] = field(default_factory=dict)
 
 
 @runtime_checkable

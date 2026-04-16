@@ -40,6 +40,9 @@ class S3:
                                Each subsequent retry doubles this value plus
                                random jitter. Default: 0.1. Same TransferManager
                                caveat as ``max_retries`` applies.
+        max_retry_delay:       Upper bound on the sleep between retries in seconds
+                               (default: 30). Prevents unbounded waits when
+                               ``max_retries`` is set to a high value.
         **session_kwargs:      Any extra keyword arguments forwarded to boto3.Session.
 
     Example::
@@ -60,11 +63,13 @@ class S3:
         endpoint_url: Optional[str] = None,
         max_retries: int = 3,
         retry_delay: float = 0.1,
+        max_retry_delay: float = 30.0,
         **session_kwargs: Any,
     ) -> None:
         self._endpoint_url = endpoint_url
         self._max_retries = max_retries
         self._retry_delay = retry_delay
+        self._max_retry_delay = max_retry_delay
         self._session = boto3.Session(
             region_name=region_name,
             aws_access_key_id=aws_access_key_id,
@@ -95,6 +100,11 @@ class S3:
     def retry_delay(self) -> float:
         """Base delay in seconds between retries (doubles on each attempt)."""
         return self._retry_delay
+
+    @property
+    def max_retry_delay(self) -> float:
+        """Maximum sleep cap in seconds between retries."""
+        return self._max_retry_delay
 
     def bucket(self, name: str) -> "Bucket":  # noqa: F821
         """Return a Bucket wrapper for the given bucket name.

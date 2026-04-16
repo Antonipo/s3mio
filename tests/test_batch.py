@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from s3mio import DeleteResult
+from s3mio import CopyResult, DeleteResult
 from s3mio.bucket import Bucket
 from s3mio.exceptions import ObjectNotFoundError, ValidationError
 
@@ -166,21 +166,28 @@ class TestBucketCopyMany:
         for src, _ in pairs:
             bucket.put(src, f"content of {src}")
 
-        count = bucket.copy_many(pairs)
-        assert count == 3
+        result = bucket.copy_many(pairs)
+        assert isinstance(result, CopyResult)
+        assert len(result) == 3
+        assert result.failed == []
         for src, dst in pairs:
             assert bucket.get_text(dst) == f"content of {src}"
 
-    def test_copy_many_returns_count(self, bucket: Bucket) -> None:
-        """Return value equals the number of pairs."""
+    def test_copy_many_returns_copy_result(self, bucket: Bucket) -> None:
+        """Return value is a CopyResult with done/failed pair lists."""
         bucket.put("a.txt", "a")
         bucket.put("b.txt", "b")
-        count = bucket.copy_many([("a.txt", "a_copy.txt"), ("b.txt", "b_copy.txt")])
-        assert count == 2
+        result = bucket.copy_many([("a.txt", "a_copy.txt"), ("b.txt", "b_copy.txt")])
+        assert isinstance(result, CopyResult)
+        assert len(result) == 2
+        assert result.done == [("a.txt", "a_copy.txt"), ("b.txt", "b_copy.txt")]
 
     def test_copy_many_empty_list_is_noop(self, bucket: Bucket) -> None:
-        """Passing an empty list returns 0 and raises no errors."""
-        assert bucket.copy_many([]) == 0
+        """Passing an empty list returns an empty CopyResult."""
+        result = bucket.copy_many([])
+        assert isinstance(result, CopyResult)
+        assert len(result) == 0
+        assert result.failed == []
 
     def test_copy_many_sources_still_exist(self, bucket: Bucket) -> None:
         """Source objects are not deleted after copy_many."""
@@ -188,11 +195,21 @@ class TestBucketCopyMany:
         bucket.copy_many([("src/x.txt", "dst/x.txt")])
         assert bucket.exists("src/x.txt")
 
-    def test_copy_many_stops_on_missing_src(self, bucket: Bucket) -> None:
-        """Raises ObjectNotFoundError if any source key does not exist."""
+    def test_copy_many_missing_src_captured_in_result(self, bucket: Bucket) -> None:
+        """A missing source key is collected in CopyResult.failed, not raised."""
         bucket.put("exists.txt", "data")
-        with pytest.raises(ObjectNotFoundError):
-            bucket.copy_many([("exists.txt", "exists_copy.txt"), ("ghost.txt", "ghost_copy.txt")])
+        result = bucket.copy_many([("exists.txt", "exists_copy.txt"), ("ghost.txt", "ghost_copy.txt")])
+        assert len(result) == 1
+        assert result.done == [("exists.txt", "exists_copy.txt")]
+        assert len(result.failed) == 1
+        assert result.failed[0][0] == "ghost.txt"
+        assert result.failed[0][1] == "ghost_copy.txt"
+        assert not bool(result)  # False because failures exist
+
+    def test_copy_many_failed_pairs_returns_retryable_list(self, bucket: Bucket) -> None:
+        """failed_pairs() returns (src, dest) tuples ready to pass back to copy_many."""
+        result = bucket.copy_many([("ghost.txt", "dst.txt")])
+        assert result.failed_pairs() == [("ghost.txt", "dst.txt")]
 
 
 # ---------------------------------------------------------------------------
@@ -254,15 +271,19 @@ class TestPrefixCopy:
         folder = bucket / "data"
         folder.put("a.csv", "col1,col2")
         folder.put("b.csv", "col3,col4")
-        count = folder.copy_many([("a.csv", "a_bak.csv"), ("b.csv", "b_bak.csv")])
-        assert count == 2
+        result = folder.copy_many([("a.csv", "a_bak.csv"), ("b.csv", "b_bak.csv")])
+        assert isinstance(result, CopyResult)
+        assert len(result) == 2
+        assert result.failed == []
         assert bucket.exists("data/a_bak.csv")
         assert bucket.exists("data/b_bak.csv")
 
     def test_prefix_copy_many_empty_list(self, bucket: Bucket) -> None:
-        """Empty pairs list returns 0."""
+        """Empty pairs list returns an empty CopyResult."""
         folder = bucket / "x"
-        assert folder.copy_many([]) == 0
+        result = folder.copy_many([])
+        assert isinstance(result, CopyResult)
+        assert len(result) == 0
 
 
 # ---------------------------------------------------------------------------

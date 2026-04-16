@@ -213,16 +213,16 @@ class TestS3RetryConfig:
         s3 = S3(max_retries=0)
         assert s3.max_retries == 0
 
-    def test_bucket_inherits_max_retries(self, bucket: Bucket) -> None:
-        """Bucket._max_retries is inherited from the parent S3 instance."""
-        assert bucket._max_retries == 3
+    def test_bucket_reads_max_retries_from_s3(self, bucket: Bucket) -> None:
+        """Bucket reads max_retries live from the parent S3 instance (no snapshot)."""
+        assert bucket._s3.max_retries == 3
 
-    def test_bucket_inherits_retry_delay(self, bucket: Bucket) -> None:
-        """Bucket._retry_delay is inherited from the parent S3 instance."""
-        assert bucket._retry_delay == 0.1
+    def test_bucket_reads_retry_delay_from_s3(self, bucket: Bucket) -> None:
+        """Bucket reads retry_delay live from the parent S3 instance (no snapshot)."""
+        assert bucket._s3.retry_delay == 0.1
 
     def test_bucket_picks_up_custom_s3_retries(self) -> None:
-        """Bucket created from a custom S3 inherits its retry settings."""
+        """Bucket created from a custom S3 reflects its retry settings."""
         import boto3
         from moto import mock_aws
 
@@ -233,8 +233,8 @@ class TestS3RetryConfig:
             s3_custom._resource = s3_custom._session.resource("s3")
             s3_custom._client = s3_custom._session.client("s3")
             b = s3_custom.bucket("any-name")
-            assert b._max_retries == 7
-            assert b._retry_delay == 0.5
+            assert b._s3.max_retries == 7
+            assert b._s3.retry_delay == 0.5
 
         _run()
 

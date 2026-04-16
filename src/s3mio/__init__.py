@@ -23,6 +23,7 @@ Exports:
     Prefix:              Scoped prefix / virtual folder.
     ObjectInfo:          Metadata returned by list() and head().
     DeleteResult:        Result of delete_many() with deleted/failed key lists.
+    CopyResult:          Result of copy_many() with done/failed pair lists.
     S3Error:             Base exception class.
     ObjectNotFoundError: Object key does not exist (404).
     BucketNotFoundError: Bucket does not exist.
@@ -33,7 +34,7 @@ Exports:
 
 __version__ = "0.1.0"
 
-from ._types import DeleteResult, ObjectInfo
+from ._types import CopyResult, DeleteResult, ObjectInfo
 from .bucket import Bucket, Prefix
 from .client import S3
 from .exceptions import (
@@ -52,6 +53,7 @@ __all__ = [
     "Prefix",
     "ObjectInfo",
     "DeleteResult",
+    "CopyResult",
     "S3Error",
     "ObjectNotFoundError",
     "BucketNotFoundError",

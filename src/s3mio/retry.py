@@ -46,12 +46,14 @@ def call_with_retry(
     max_retries: int,
     base_delay: float,
     *args: Any,
+    max_delay: float = 30.0,
     **kwargs: Any,
 ) -> Any:
     """Call *func* with exponential-backoff retry on transient S3 errors.
 
     On each failure the delay is ``base_delay * 2 ** attempt`` plus a random
-    jitter in ``[0, base_delay)`` to spread concurrent retries apart.
+    jitter in ``[0, base_delay)``, capped at *max_delay* to prevent unbounded
+    sleep times when *max_retries* is large.
 
     Args:
         func:        The callable to invoke.
@@ -59,6 +61,8 @@ def call_with_retry(
                      (0 = no retry — fail immediately on any error).
         base_delay:  Base sleep duration in seconds before the first retry.
         *args:       Positional arguments forwarded to *func*.
+        max_delay:   Upper bound on sleep duration in seconds (default: 30).
+                     Prevents runaway waits when ``max_retries`` is set high.
         **kwargs:    Keyword arguments forwarded to *func*.
 
     Returns:
@@ -93,7 +97,7 @@ def call_with_retry(
             code = exc.response["Error"]["Code"]
             if code not in _RETRYABLE_CODES or attempt >= max_retries:
                 raise
-            delay = base_delay * (2**attempt) + random.uniform(0, base_delay)
+            delay = min(base_delay * (2**attempt) + random.uniform(0, base_delay), max_delay)
             logger.warning(
                 "Transient S3 error [%s], retry %d/%d in %.2fs",
                 code,
@@ -105,7 +109,7 @@ def call_with_retry(
         except _RETRYABLE_NETWORK_ERRORS as exc:
             if attempt >= max_retries:
                 raise
-            delay = base_delay * (2**attempt) + random.uniform(0, base_delay)
+            delay = min(base_delay * (2**attempt) + random.uniform(0, base_delay), max_delay)
             logger.warning(
                 "Network error (%s), retry %d/%d in %.2fs",
                 type(exc).__name__,
