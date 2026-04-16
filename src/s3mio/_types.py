@@ -1,0 +1,95 @@
+"""Internal types and protocols for s3mio."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Iterator, Protocol, runtime_checkable
+
+
+@dataclass
+class ObjectInfo:
+    """Metadata for a single S3 object returned by :meth:`Bucket.list` or :meth:`Bucket.head`.
+
+    Fields populated by ``list()``
+        key, size, last_modified, etag, storage_class.
+
+    Additional fields populated only by ``head()``
+        content_type, metadata.
+
+    Attributes:
+        key:           Full S3 key (e.g. ``"users/john.json"``).
+        size:          Object size in bytes.
+        last_modified: UTC timestamp of the last modification.
+        etag:          Entity tag (MD5 or multipart hash, quotes stripped).
+        storage_class: S3 storage class (e.g. ``"STANDARD"``, ``"INTELLIGENT_TIERING"``).
+        content_type:  MIME type of the object (e.g. ``"application/json"``).
+                       Empty string when returned from ``list()`` — use ``head()``
+                       to retrieve this field.
+        metadata:      User-defined metadata key-value pairs set at upload time.
+                       Empty dict when returned from ``list()`` — use ``head()``
+                       to retrieve this field.
+    """
+
+    key: str
+    size: int
+    last_modified: datetime
+    etag: str
+    storage_class: str
+    content_type: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+@runtime_checkable
+class BucketProtocol(Protocol):
+    """Structural protocol for Bucket-like objects.
+
+    Useful for type-checking code that accepts either a Bucket or a Prefix.
+    """
+
+    @property
+    def name(self) -> str: ...
+
+    def put(self, key: str, data: Any, **kwargs: Any) -> None: ...
+
+    def get_json(self, key: str) -> Any: ...
+
+    def get_text(self, key: str) -> str: ...
+
+    def get_bytes(self, key: str) -> bytes: ...
+
+    def delete(self, key: str) -> None: ...
+
+    def exists(self, key: str) -> bool: ...
+
+    def list(self, prefix: str = "", delimiter: str = "") -> list[ObjectInfo]: ...
+
+    def __truediv__(self, segment: str) -> "PrefixProtocol": ...
+
+
+@runtime_checkable
+class PrefixProtocol(Protocol):
+    """Structural protocol for Prefix-like objects."""
+
+    @property
+    def full_prefix(self) -> str: ...
+
+    def put(self, key: str, data: Any, **kwargs: Any) -> None: ...
+
+    def get_json(self, key: str) -> Any: ...
+
+    def get_text(self, key: str) -> str: ...
+
+    def get_bytes(self, key: str) -> bytes: ...
+
+    def delete(self, key: str) -> None: ...
+
+    def exists(self, key: str) -> bool: ...
+
+    def list(self) -> list[ObjectInfo]: ...
+
+    def delete_all(self) -> int: ...
+
+    def __truediv__(self, segment: str) -> "PrefixProtocol": ...
+
+    def __iter__(self) -> Iterator[ObjectInfo]: ...
